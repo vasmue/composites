@@ -236,7 +236,7 @@ def main():
     out_path='/p/scratch/chhb19/mueller29/composites/100m/'+var+'/'
     os.makedirs(out_path, exist_ok=True)
     
-    for dd in range(330,ndays):
+    for dd in range(330,ndays): #####remember to reset!! this is just to rerun end of November and December
         lons=all_lons[dd].flatten()
         lats=all_lats[dd].flatten()
         rads=all_rads[dd].flatten()
