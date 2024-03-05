@@ -1,7 +1,8 @@
 import os
-#os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
 
-import pyfesom2 as pf
+from pyfesom2.ut import scalar_g2r, scalar_r2g
+from pyfesom2 import load_mesh
+
 import xarray as xr
 import numpy as np
 import shutil
@@ -58,7 +59,7 @@ def haversine(lon1, lat1, lon2, lat2):
 def get_dxdy(lon1, lon2, lat1, lat2):
     # Calculate distance and angle
     dist = haversine(lon1, lat1, lon2, lat2)
-    ang = np.arctan2(lon2 - lon1, lat2 - lat1)
+    ang = np.arctan2(lat2 - lat1,lon2 - lon1)
     
     # Calculate dx and dy
     dx = dist * np.cos(ang)
@@ -72,31 +73,34 @@ def get_points_within_radius(lon_in, lat_in, lon_target, lat_target, radius, fac
     max_radius = radius*fac
     # Filter points within the maximum radius
     within_radius_indices = np.where(distances <= max_radius)[0]
+    within_one_radius = np.where(distances <= radius)[0]
     within_radius_lon = lon_in[within_radius_indices]
     within_radius_lat = lat_in[within_radius_indices]
     
-    dx =  within_radius_lon - lon_target
-    dy =  within_radius_lat - lat_target
+    dlon =  within_radius_lon - lon_target
+    dlat =  within_radius_lat - lat_target
 
     # Calculate differences between target point and filtered points
-    dx_km, dy_km = np.vectorize(get_dxdy)(lon_target, within_radius_lon, lat_target, within_radius_lat)
+    dx_km, dy_km = get_dxdy(lon_target, within_radius_lon, lat_target, within_radius_lat)
+
     dx_rel = dx_km/radius
     dy_rel = dy_km/radius
-    return within_radius_indices, dx, dy, dx_km, dy_km, dx_rel, dy_rel
+    return within_one_radius, within_radius_indices, dlon, dlat, dx_km, dy_km, dx_rel, dy_rel
 
-def process_eddy(lon_target, lat_target, radius_target, lon_in, lat_in, data_in, fac, X, Y):
-    within_radius_indices, _, _, _, _, dx_rel, dy_rel = get_points_within_radius(lon_in, lat_in, lon_target, lat_target, radius_target, fac)
+def process_eddy(lon_target, lat_target, radius_target, lon_in, lat_in, data_in,ice_in, fac, X, Y):
+    within_one_radius, within_radius_indices, _, _, _, _, dx_rel, dy_rel = get_points_within_radius(lon_in, lat_in, lon_target, lat_target, radius_target, fac)
     data_tmp = data_in[within_radius_indices]
     gridded_data = griddata((dx_rel.ravel(), dy_rel.ravel()), data_tmp.ravel(), (X, Y), method='linear', fill_value=np.nan)
-
+    ice_avg = ice_in[within_one_radius].mean(dim='nod2').round(3).values
     del within_radius_indices
+    del within_one_radius
     del data_in
     del data_tmp
     del dx_rel
     del dy_rel
     del X
     del Y
-    return gridded_data
+    return gridded_data, ice_avg
 
 def create_empty_netcdf(outfile,date,var,ne,nx,ny):
     if (os.path.exists(outfile)):
@@ -115,6 +119,8 @@ def create_empty_netcdf(outfile,date,var,ne,nx,ny):
     ds['lon'] = xr.DataArray(np.empty((1,ne)), dims=['time','ee']) #center lon
     ds['lat'] = xr.DataArray(np.empty((1,ne)), dims=['time','ee']) #center lat
     ds['rad'] = xr.DataArray(np.empty((1,ne)), dims=['time','ee']) #radius
+    ds['speed'] = xr.DataArray(np.empty((1,ne)), dims=['time','ee']) #rot. speed
+    ds['ice_avg'] = xr.DataArray(np.empty((1,ne)), dims=['time','ee']) #average sea ice concentration
     ds['time'] = xr.DataArray([time_values_seconds], dims='time', attrs={'units': 'seconds since 2015-01-01 0:0:0'}) #the same for every eddy on that day, so can be set here
     ds['num'] =  xr.DataArray(np.empty((1,ne)), dims=['time','ee']) #running number per day -> 'ee'
     # Write the dataset to a NetCDF file with specified permissions
@@ -122,15 +128,18 @@ def create_empty_netcdf(outfile,date,var,ne,nx,ny):
         
     
 @delayed
-def process_date(lon_target, lat_target, type_target, radius_target, lon_in, lat_in, data_in, fac, X, Y, ind,var,outfile,lock):
-    gridded_data = process_eddy(lon_target, lat_target, radius_target, lon_in, lat_in, data_in, fac, X, Y)
+def process_date(lon_target, lat_target, type_target, radius_target, speed_target,lon_in, lat_in, data_in, ice_in, fac, X, Y, ind,var,outfile,lock):
+    gridded_data,ice_avg = process_eddy(lon_target, lat_target, radius_target,lon_in, lat_in, data_in, ice_in, fac, X, Y)
+    lon_target,lat_target = scalar_r2g(-90,90,90,np.array([lon_target]),np.array([lat_target])) #rotate eddy lon/lat to coordinates at pole
     with lock:    
         with xr.open_dataset(outfile, mode='a') as ds:
             ds[var][0, ind, : , :] = gridded_data
             ds['cyc'][0, ind] = type_target
-            ds['lon'][0, ind] = lon_target
-            ds['lat'][0, ind] = lat_target
+            ds['lon'][0, ind] = lon_target[0]
+            ds['lat'][0, ind] = lat_target[0]
             ds['rad'][0, ind] = radius_target
+            ds['speed'][0, ind] = speed_target
+            ds['ice_avg'][0, ind] = ice_avg
             ds['num'][0,ind] = ind
         ds.to_netcdf(outfile, mode='a', encoding={var: {'dtype': 'float32'}})
 
@@ -143,7 +152,7 @@ def main():
 
     #spawn a parallel cluster
     n_cores = 12
-    mem_lim = str(int(100*np.floor(960/n_cores)))+'MB' #128GB total memory when running 4 jobs on booster node, set to MB, divide by number of cores and round to next 100
+    mem_lim = str(int(100*np.floor(1280/n_cores)))+'MB' #128GB total memory when running 4 jobs on booster node, set to MB, divide by number of cores and round to next 100
     dask_dir = '/p/scratch/chhb19/mueller29/dask_dir/'+generate_random_string(10)
     if os.path.exists(dask_dir):
         shutil.rmtree(dask_dir)
@@ -161,13 +170,17 @@ def main():
     mesh_path = '/p/project/chhb19/meshes/AO_40/'
     
     # load fesom mesh stuff
-    mesh=pf.load_mesh(mesh_path)
+    mesh=load_mesh(mesh_path)
     model_lons=mesh.x2
     model_lats=mesh.y2
-    
     # rotate to equator (eddy detection stuff is saved in rotated coordinates)
-    lons_rot,lats_rot = pf.ut.scalar_g2r(-90,90,90,model_lons,model_lats)
+    lons_rot,lats_rot = scalar_g2r(-90,90,90,model_lons,model_lats)
 
+    lon_in_dask_array = da.from_array(lons_rot, chunks='auto')
+    client.persist(lon_in_dask_array)
+    lat_in_dask_array = da.from_array(lats_rot, chunks='auto')
+    client.persist(lat_in_dask_array)
+    
     # load eddy shapes from Nencioli detection
     global all_days, all_lats, all_lons, all_rads, all_types, all_speeds  # Declare variables as global
 
@@ -176,6 +189,7 @@ def main():
 
     all_days = None  # Initialize all_days
     all_lats = None  # Initialize all_lats
+    
     all_lons = None  # Initialize all_lons
     all_rads = None  # Initialize all_rads
     all_types = None  # Initialize all_types
@@ -222,11 +236,11 @@ def main():
     cyclic_length = cyclic_length * math.pi / 180 
 
     # load FESOM data
-    data_all=xr.open_mfdataset((data_path+var+'.fesom.'+str(year)+'.nc'),chunks={'time':time_chunk,'nod2':nod2_chunk})[var]
-
+    data_all=xr.open_mfdataset((data_path+var+'.fesom.'+str(year)+'.nc'),chunks={'time':time_chunk,'nod2':nod2_chunk})[var].astype('float32')
+    ice_all=xr.open_mfdataset((data_path+'a_ice.fesom.'+str(year)+'.nc'),chunks={'time':time_chunk,'nod2':nod2_chunk})['a_ice'].astype('float32')
     
     #define regular mesh in multiples of R
-    reg_x = np.arange(-3.1,3.1,.1)
+    reg_x = np.arange(-3.1,3.2,.1)
     reg_y = np.arange(-3,3.1,.1)
     X,Y = np.meshgrid(reg_x,reg_y)
     
@@ -236,9 +250,9 @@ def main():
     out_path='/p/scratch/chhb19/mueller29/composites/100m/'+var+'/'
     os.makedirs(out_path, exist_ok=True)
     
-    for dd in range(330,ndays): #####remember to reset!! this is just to rerun end of November and December
+    for dd in range(ndays):
         lons=all_lons[dd].flatten()
-        lats=all_lats[dd].flatten()
+        lats=all_lats[dd].flatten()   
         rads=all_rads[dd].flatten()
         types=all_types[dd].flatten()
         speeds=all_speeds[dd].flatten()
@@ -267,6 +281,8 @@ def main():
         data_in = data-data_coarse
         date_xr = data_all.time[dd]
         
+        ice_in = ice_all[dd,:]
+        
         filename = 'composite_'+var+'_'+date_string+'.nc'
 
         #Create the empty Dataset
@@ -276,15 +292,9 @@ def main():
         #persist the input data
         data_in_dask_array = da.from_array(data_in, chunks='auto')
         client.persist(data_in_dask_array)
-
-        lon_in_dask_array = da.from_array(lons_rot, chunks='auto')
-        client.persist(lon_in_dask_array)
-
-        lat_in_dask_array = da.from_array(lats_rot, chunks='auto')
-        client.persist(lat_in_dask_array)
-
-        # datetime_dask_array = da.from_array(datetime_object)
-        # client.persist(datetime_dask_array)
+        
+        client.persist(ice_in)
+        
 
         #make composites first lazy, then compute in parallel and save
         results = []
@@ -295,7 +305,8 @@ def main():
             lat_eddy = lats[ii]
             type_eddy = types[ii]
             rad_eddy = rads[ii]
-            results.append(process_date(lon_eddy, lat_eddy, type_eddy, rad_eddy, lon_in_dask_array, lat_in_dask_array, data_in_dask_array, fac, X, Y, ii,var,outfile,lock))  
+            speed_eddy = speeds[ii]
+            results.append(process_date(lon_eddy, lat_eddy, type_eddy, rad_eddy, speed_eddy, lon_in_dask_array, lat_in_dask_array, data_in_dask_array, ice_in, fac, X, Y, ii,var,outfile,lock))  
                     
         result=dask.compute(results)
 
