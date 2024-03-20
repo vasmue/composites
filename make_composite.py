@@ -121,7 +121,7 @@ def create_empty_netcdf(outfile,date,var,ne,nx,ny):
     ds['rad'] = xr.DataArray(np.empty((1,ne)), dims=['time','ee']) #radius
     ds['speed'] = xr.DataArray(np.empty((1,ne)), dims=['time','ee']) #rot. speed
     ds['ice_avg'] = xr.DataArray(np.empty((1,ne)), dims=['time','ee']) #average sea ice concentration
-    ds['time'] = xr.DataArray([time_values_seconds], dims='time', attrs={'units': 'seconds since 2015-01-01 0:0:0'}) #the same for every eddy on that day, so can be set here
+    ds['time'] = xr.DataArray([time_values_seconds], dims='time', attrs={'units': 'seconds since '+str(date.dt.year.values)+'-01-01 0:0:0'}) #the same for every eddy on that day, so can be set here
     ds['num'] =  xr.DataArray(np.empty((1,ne)), dims=['time','ee']) #running number per day -> 'ee'
     # Write the dataset to a NetCDF file with specified permissions
     ds.to_netcdf(outfile, mode='w', encoding={var: {'dtype': 'float32'}})        
@@ -278,7 +278,7 @@ def main():
         #load and high-pass filter data
         data = data_all[dd,:].values
         data_coarse = jf.compute(1, Kc[-1], data)
-        data_in = data-data_coarse
+        data_in = data-data_coarse #highpass filtered data
         date_xr = data_all.time[dd]
         
         ice_in = ice_all[dd,:]
